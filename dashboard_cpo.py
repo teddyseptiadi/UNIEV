@@ -4,6 +4,7 @@ import plotly.express as px
 import time
 from datetime import datetime
 import numpy as np
+import requests
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(
@@ -140,7 +141,7 @@ with st.sidebar:
     st.caption("Smart Charging Management System")
     st.divider()
     
-    menu = st.radio("Menu Utama", ["Dashboard Overview", "Live Monitoring", "Financial Reports", "User Management"], index=0)
+    menu = st.radio("Menu Utama", ["Dashboard Overview", "Live Monitoring", "Financial Reports", "User Management", "CPO Admin", "Tariffs", "Tickets", "Payments", "EVSE Management"], index=0)
     
     st.divider()
     st.markdown(f"**System Status:** 🟢 Online")
@@ -262,3 +263,168 @@ elif menu == "User Management":
 if menu != "Live Monitoring":
     time.sleep(10)
     st.rerun()
+
+# --- 9. PAGE: CPO ADMIN ---
+if menu == "CPO Admin":
+    st.title("🏢 CPO Administration")
+    api = st.text_input("API Base URL", "http://localhost:8000")
+    with st.form("cpo_form"):
+        cpo_id = st.text_input("CPO ID", "CPO-001")
+        name = st.text_input("Nama CPO", "Contoh CPO")
+        npwp = st.text_input("NPWP", "")
+        siup = st.text_input("SIUP", "")
+        address = st.text_input("Alamat", "")
+        pic_name = st.text_input("PIC Nama", "")
+        pic_phone = st.text_input("PIC Telp", "")
+        profit = st.number_input("Bagi Hasil (%)", min_value=0.0, max_value=100.0, value=0.0)
+        submitted = st.form_submit_button("Register CPO")
+        if submitted:
+            payload = {"cpo_id": cpo_id, "name": name, "npwp": npwp, "siup": siup, "address": address, "pic_name": pic_name, "pic_phone": pic_phone, "profit_sharing_percent": profit}
+            try:
+                r = requests.post(f"{api}/api/cpo/register", json=payload, timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
+    colv1, colv2 = st.columns(2)
+    with colv1:
+        vcpo = st.text_input("Verifikasi CPO ID", "CPO-001")
+        if st.button("Verifikasi"):
+            try:
+                r = requests.post(f"{api}/api/cpo/{vcpo}/verify", timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
+    with colv2:
+        wcpo = st.text_input("Wallet CPO ID", "CPO-001")
+        if st.button("Lihat Wallet"):
+            try:
+                r = requests.get(f"{api}/api/cpo/{wcpo}/wallet", timeout=10)
+                st.json(r.json())
+            except Exception as e:
+                st.error(str(e))
+
+# --- 10. PAGE: TARIFFS ---
+if menu == "Tariffs":
+    st.title("💳 Tariff Templates")
+    api = st.text_input("API Base URL", "http://localhost:8000")
+    with st.form("tariff_form"):
+        template_id = st.text_input("Template ID", "T-DEFAULT")
+        name = st.text_input("Nama", "Default Per kWh")
+        ttype = st.selectbox("Tipe", ["per_kwh", "flat", "time_based"])
+        price = st.number_input("Harga/kWh", min_value=0.0, value=2500.0)
+        idle_fee = st.number_input("Idle Fee/menit", min_value=0.0, value=0.0)
+        cpo_id = st.text_input("CPO ID", "CPO-001")
+        submitted = st.form_submit_button("Simpan Template")
+        if submitted:
+            payload = {"template_id": template_id, "name": name, "type": ttype, "price_per_kwh": price, "idle_fee_per_min": idle_fee, "cpo_id": cpo_id}
+            try:
+                r = requests.post(f"{api}/api/tariffs/templates", json=payload, timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
+    st.divider()
+    cid = st.text_input("Assign ke Charger ID", "SIM-001")
+    tid = st.text_input("Template ID untuk Assign", "T-DEFAULT")
+    if st.button("Assign Tariff"):
+        try:
+            r = requests.post(f"{api}/api/tariffs/assign", params={"charger_id": cid, "template_id": tid}, timeout=10)
+            st.success(r.json())
+        except Exception as e:
+            st.error(str(e))
+
+# --- 11. PAGE: TICKETS ---
+if menu == "Tickets":
+    st.title("🎟️ Ticketing")
+    api = st.text_input("API Base URL", "http://localhost:8000")
+    with st.form("ticket_form"):
+        ticket_id = st.text_input("Ticket ID", "TCK-0001")
+        cpo_id = st.text_input("CPO ID", "CPO-001")
+        charger_id = st.text_input("Charger ID", "SIM-001")
+        category = st.selectbox("Kategori", ["StartFailed", "AuthFailed", "PaymentPending", "ConnectorBroken", "PriceMismatch", "AppError"]) 
+        description = st.text_area("Deskripsi", "")
+        priority = st.selectbox("Prioritas", ["Low", "Normal", "High", "Critical"], index=1)
+        submitted = st.form_submit_button("Buat Ticket")
+        if submitted:
+            payload = {"ticket_id": ticket_id, "cpo_id": cpo_id, "charger_id": charger_id, "category": category, "description": description, "priority": priority}
+            try:
+                r = requests.post(f"{api}/api/tickets", json=payload, timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
+    st.divider()
+    utid = st.text_input("Update Ticket ID", "TCK-0001")
+    status = st.selectbox("Status", ["OPEN", "IN_PROGRESS", "ESCALATED", "RESOLVED"], index=0)
+    assignee = st.text_input("Teknisi", "TECH-01")
+    if st.button("Update Ticket"):
+        try:
+            r = requests.put(f"{api}/api/tickets/{utid}", params={"status": status, "assignee": assignee}, timeout=10)
+            st.success(r.json())
+        except Exception as e:
+            st.error(str(e))
+
+# --- 12. PAGE: PAYMENTS ---
+if menu == "Payments":
+    st.title("💳 Payments")
+    api = st.text_input("API Base URL", "http://localhost:8000")
+    st.subheader("Konfigurasi Gateway")
+    with st.form("pg_form"):
+        provider = st.selectbox("Provider", ["xendit","midtrans"])
+        environment = st.selectbox("Environment", ["development","production"])
+        api_key = st.text_input("API Key", type="password")
+        name = st.text_input("Nama Alias", "Default Gateway")
+        cpo_id = st.text_input("CPO ID", "CPO-001")
+        submitted = st.form_submit_button("Simpan Provider")
+        if submitted:
+            payload = {"provider": provider, "environment": environment, "api_key": api_key, "name": name, "cpo_id": cpo_id}
+            try:
+                r = requests.post(f"{api}/api/payments/providers", json=payload, timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
+    st.divider()
+    st.subheader("Buat Payment Intent")
+    with st.form("intent_form"):
+        provider2 = st.selectbox("Provider", ["xendit","midtrans"], key="prov2")
+        amount = st.number_input("Amount (IDR)", min_value=1000.0, value=50000.0)
+        description = st.text_input("Deskripsi", "Topup atau Pembayaran Sesi")
+        cpo_id2 = st.text_input("CPO ID", "CPO-001")
+        charger_id = st.text_input("Charger ID", "SIM-001")
+        user_id = st.text_input("User ID", "USR-001")
+        make_intent = st.form_submit_button("Create Intent")
+        if make_intent:
+            payload = {"provider": provider2, "amount": amount, "description": description, "cpo_id": cpo_id2, "charger_id": charger_id, "user_id": user_id}
+            try:
+                r = requests.post(f"{api}/api/payments/intent", json=payload, timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
+    st.divider()
+    st.subheader("Daftar Provider")
+    try:
+        cpo_filter = st.text_input("Filter CPO ID", "")
+        params = {"cpo_id": cpo_filter} if cpo_filter else {}
+        providers = requests.get(f"{api}/api/payments/providers", params=params, timeout=10).json()
+        st.dataframe(pd.DataFrame(providers), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(str(e))
+
+# --- 13. PAGE: EVSE MANAGEMENT ---
+if menu == "EVSE Management":
+    st.title("🔧 EVSE Management")
+    api = st.text_input("API Base URL", "http://localhost:8000")
+    with st.form("evse_cmd_form"):
+        charger_id = st.text_input("Charger ID", "SIM-001")
+        action = st.selectbox("Action", ["REBOOT","UNLOCK","LOCK","UPDATE_FIRMWARE","UPDATE_CONFIG"])
+        payload = st.text_area("Payload JSON (opsional)", "{}")
+        submit = st.form_submit_button("Kirim Perintah")
+        if submit:
+            try:
+                jp = {}
+                try:
+                    import json
+                    jp = json.loads(payload or "{}")
+                except: jp = {}
+                r = requests.post(f"{api}/api/evse/command", params={"charger_id": charger_id, "action": action}, json=jp, timeout=10)
+                st.success(r.json())
+            except Exception as e:
+                st.error(str(e))
