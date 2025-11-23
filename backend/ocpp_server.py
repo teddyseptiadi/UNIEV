@@ -20,6 +20,9 @@ parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
+# --- BILLING ENGINE IMPORT ---
+from backend.billing_engine import BillingCalculator, CARBON_SAVING_FACTOR
+
 # --- CONFIG LOAD (Tolerant) ---
 try:
     from backend import config
@@ -48,6 +51,7 @@ except ImportError:
         logger.warning("⚠️ Supabase client not found. DB operations will be skipped.")
 
 # Executor untuk DB (Agar tidak memblokir WebSocket)
+# [FIX] Gunakan ThreadPoolExecutor dari concurrent.futures
 db_executor = ThreadPoolExecutor(max_workers=3)
 
 # --- OCPP LIBRARY SETUP ---
@@ -90,6 +94,38 @@ def _thread_save_boot(charger_id, vendor, model):
     except Exception as e:
         logger.warning(f"   └── [DB ERROR] Boot: {e}")
 
+def _thread_save_transaction(charger_id, transaction_id, id_tag, meter_start, meter_stop, start_time, stop_time):
+    if not supabase_client or not ENABLE_DB: return
+    try:
+        kwh_usage = (meter_stop - meter_start) / 1000.0
+        duration_seconds = (stop_time - start_time).total_seconds()
+        duration_minutes = duration_seconds / 60
+
+        # Calculate billing
+        billing_calculator = BillingCalculator(supabase_client)
+        bill_details = billing_calculator.calculate_final_bill(charger_id, kwh_usage, duration_minutes)
+        carbon_saved = billing_calculator.calculate_carbon_saved(kwh_usage)
+
+        data = {
+            "transaction_id": transaction_id,
+            "charger_id": charger_id,
+            "id_tag": id_tag,
+            "meter_start": meter_start,
+            "meter_stop": meter_stop,
+            "start_time": start_time.isoformat(),
+            "stop_time": stop_time.isoformat(),
+            "total_kwh": round(kwh_usage, 2),
+            "total_amount": bill_details["total_amount"],
+            "carbon_saved_kg": carbon_saved,
+            "status": "COMPLETED",
+            "tariff_name": bill_details["tariff_name"],
+            "is_peak_hour": bill_details["is_peak_hour"]
+        }
+        supabase_client.table("transactions").insert(data).execute()
+        logger.info(f"   └── [DB] Saved Transaction: {transaction_id} for {charger_id}")
+    except Exception as e:
+        logger.warning(f"   └── [DB ERROR] Transaction: {e}")
+
 def _thread_save_status(charger_id, status):
     if not supabase_client or not ENABLE_DB: return
     try:
@@ -98,6 +134,10 @@ def _thread_save_status(charger_id, status):
 
 # --- MAIN CHARGEPOINT HANDLER ---
 class ChargePointHandler(cp16):
+    def __init__(self, id, websocket):
+        super().__init__(id, websocket)
+        self.current_transaction = {} # Untuk menyimpan state transaksi
+
 
     # [PERBAIKAN UTAMA] Parameter menggunakan camelCase (sesuai JSON OCPP)
     # Tambahkan **kwargs untuk menangkap parameter tambahan agar tidak crash
@@ -135,23 +175,58 @@ class ChargePointHandler(cp16):
 
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connectorId, idTag, meterStart, timestamp, **kwargs):
-        logger.info(f"⚡ START TX: {self.id} (Tag: {idTag})")
+        logger.info(f"⚡ START TX: {self.id} (Tag: {idTag}, Meter: {meterStart})")
+        
+        # Generate a unique transaction ID (e.g., timestamp)
+        transaction_id = int(datetime.utcnow().timestamp())
+        
+        # Store transaction details in memory
+        self.current_transaction[connectorId] = {
+            "transaction_id": transaction_id,
+            "id_tag": idTag,
+            "meter_start": meterStart,
+            "start_time": datetime.utcnow()
+        }
+
         return call_result.StartTransactionPayload(
-            transactionId=int(datetime.utcnow().timestamp()),
+            transactionId=transaction_id,
             idTagInfo={"status": "Accepted"}
         )
 
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transactionId, meterStop, timestamp, **kwargs):
         logger.info(f"🛑 STOP TX: {transactionId} (Meter: {meterStop})")
+        
+        # [FIX] Ambil connectorId dari kwargs jika ada, atau asumsikan 1
+        connector_id = kwargs.get('connectorId', 1)
+
+        # Retrieve transaction details from memory
+        if connector_id in self.current_transaction and self.current_transaction[connector_id]["transaction_id"] == transactionId:
+            tx_data = self.current_transaction.pop(connector_id)
+            
+            # Save transaction to DB in background
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(db_executor, _thread_save_transaction,
+                                 self.id,
+                                 tx_data["transaction_id"],
+                                 tx_data["id_tag"],
+                                 tx_data["meter_start"],
+                                 meterStop,
+                                 tx_data["start_time"],
+                                 datetime.utcnow())
+        else:
+            logger.warning(f"   └── [OCPP] StopTransaction received for unknown or mismatched transaction ID: {transactionId}")
+
         return call_result.StopTransactionPayload(
             idTagInfo={"status": "Accepted"}
         )
 
     @on(Action.MeterValues)
     async def on_meter_values(self, connectorId, meterValue, **kwargs):
-        # MeterValues sering mengirim data kompleks, gunakan kwargs agar aman
-        # logger.info(f"📈 METER: {self.id}")
+        # MeterValues sering mengirim data kompleks, gunakan kwargs agar aman.
+        # Untuk saat ini, kita hanya log dan tidak menyimpan setiap meter value ke DB
+        # karena bisa sangat banyak. Hanya total di StopTransaction yang disimpan.
+        # logger.debug(f"📈 METER: {self.id} (Conn: {connectorId})")
         return call_result.MeterValuesPayload()
 
 # --- CONNECTION HANDLER (UNIVERSAL) ---
