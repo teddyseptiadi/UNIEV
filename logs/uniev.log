@@ -1,0 +1,26 @@
+Traceback (most recent call last):
+  File "/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/main_api.py", line 15, in <module>
+    @app.post("/api/billing/manual-invoice")
+     ^^^
+NameError: name 'app' is not defined
+Traceback (most recent call last):
+  File "/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/ocpp_server.py", line 70, in <module>
+    class ChargePointHandler(cp16):
+  File "/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/ocpp_server.py", line 78, in ChargePointHandler
+    @on(Action.BootNotification)
+        ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: type object 'Action' has no attribute 'BootNotification'. Did you mean: 'boot_notification'?
+/opt/homebrew/Caskroom/miniconda/base/bin/python3: can't open file '/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/billing.py': [Errno 2] No such file or directory
+/opt/homebrew/Caskroom/miniconda/base/bin/python3: can't open file '/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/billing.py': [Errno 2] No such file or directory
+Traceback (most recent call last):
+  File "/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/ocpp_server.py", line 70, in <module>
+    class ChargePointHandler(cp16):
+  File "/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/ocpp_server.py", line 78, in ChargePointHandler
+    @on(Action.BootNotification)
+        ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: type object 'Action' has no attribute 'BootNotification'. Did you mean: 'boot_notification'?
+Traceback (most recent call last):
+  File "/Users/teddy/Downloads/Project/UNIEV/UNIEV/backend/main_api.py", line 15, in <module>
+    @app.post("/api/billing/manual-invoice")
+     ^^^
+NameError: name 'app' is not defined
