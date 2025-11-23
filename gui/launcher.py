@@ -1,282 +1,245 @@
-import sys
-import os
-import subprocess
+import asyncio
 import threading
-import time
-import socket
-import psutil
 import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox
+import time
+import os
+import sys
+import subprocess
+import psutil
+import socket
 from datetime import datetime
-import ttkbootstrap as tb
-from ttkbootstrap.constants import *
+from concurrent.futures import ThreadPoolExecutor
 
-# --- FIX PATH IMPORT ---
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(CURRENT_DIR)
-sys.path.append(ROOT_DIR)
+# --- Ngrok Imports ---
+try:
+    from pyngrok import ngrok
+    from pyngrok.exception import PyngrokNgrokInstallError, PyngrokSecurityError
+except ImportError:
+    messagebox.showwarning("Ngrok Warning", "Library 'pyngrok' tidak ditemukan. Fitur Ngrok akan dinonaktifkan.")
+    ngrok = None
+    PyngrokNgrokInstallError = Exception
+    PyngrokSecurityError = Exception
 
-from backend import config
-from backend.database import Database
+# --- TTK Bootstrap Setup (Assuming installed) ---
+try:
+    import ttkbootstrap as tb
+    from ttkbootstrap.constants import *
+except ImportError:
+    import tkinter.ttk as tb
+    from tkinter.constants import *
 
-class ServiceNode:
-    """Class Helper untuk menyimpan state setiap Service"""
-    def __init__(self, name, script, port):
-        self.name = name
-        self.script = script
-        self.port = port
-        self.process = None
-        self.prev_io = None
-        self.current_speed_in = 0.0 # KB/s
-        self.current_speed_out = 0.0 # KB/s
+# --- Path & Config Setup ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(current_dir)
+sys.path.insert(0, ROOT_DIR)
+
+try:
+    from backend import config
+    HOST = getattr(config, "HOST", "0.0.0.0")
+    PORT = getattr(config, "OCPP_PORT", 9000)
+except ImportError:
+    HOST = "0.0.0.0"
+    PORT = 9000
+
+# --- GLOBAL STATE & EXECUTORS ---
+active_processes = {}
+db_executor = ThreadPoolExecutor(max_workers=3) 
+
+# --- HELPER FUNCTIONS ---
+def log_message(text, log_area):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    try:
+        log_area.insert(tk.END, f"[{timestamp}] {text}\n")
+        log_area.see(tk.END)
+    except:
+        pass
+
+# Fungsi yang akan dijalankan oleh subprocess
+def run_process_async(script_name, prefix, log_area):
+    script_path = os.path.join(ROOT_DIR, 'backend', script_name)
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-u", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        active_processes[prefix] = process
+        log_message(f"🚀 {prefix} Server Aktif (PID: {process.pid})", log_area)
         
-        # UI Component References
-        self.status_lamp = None
-        self.lbl_pid = None     # NEW: Label PID
-        self.lbl_speed_in = None
-        self.lbl_speed_out = None
-        self.btn_control = None
+        for line in iter(process.stdout.readline, ''):
+            log_message(f"[{prefix}] {line.strip()}", log_area)
+        
+        process.wait()
+        
+    except Exception as e:
+        log_message(f"❌ {prefix} CRASH: {e}", log_area)
+    finally:
+        if prefix in active_processes:
+            del active_processes[prefix]
+        log_message(f"🛑 {prefix} Server Stopped.", log_area)
 
-class UnievOrchestrator(tb.Window):
+
+# --- MAIN GUI CLASS ---
+class UnievLauncher(tk.Tk):
     def __init__(self):
-        super().__init__(themename="cyborg")
-        self.title("UNIEV COMMAND CENTER - System Monitor")
-        self.geometry("1250x750") # Sedikit diperlebar agar muat info PID
+        super().__init__()
+        self.title("UNIEV Launcher (OCPP/API/Ngrok)")
+        self.geometry("950x700")
+
+        self.server_port = PORT
+        self.ngrok_tunnel = None
+        self.auth_token = "YOUR_NGROK_AUTH_TOKEN"
         
-        self.db_latency = 0
-        self.running = True
+        self.create_widgets()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         
-        # Registrasi Services
-        self.services = {
-            "OCPP": ServiceNode("OCPP Server", "ocpp_server.py", config.PORT_OCPP),
-            "API": ServiceNode("REST API", "main_api.py", config.PORT_API),
-            "OCPI": ServiceNode("OCPI Roaming", "ocpi_service.py", config.PORT_OCPI)
+        # Start background monitoring loop
+        self.after(1000, self.update_status_loop)
+
+    def create_widgets(self):
+        main_frame = tb.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- 1. NGrok / External Panel ---
+        ngrok_frame = ttk.Labelframe(main_frame, text=" External Connectivity ", padding=10)
+        ngrok_frame.pack(fill=tk.X, pady=(0, 15))
+
+        tb.Label(ngrok_frame, text=f"OCPP Port: {self.server_port}").pack(side=tk.LEFT, padx=5)
+        
+        # Status
+        tb.Label(ngrok_frame, text="| Ngrok Status:").pack(side=tk.LEFT, padx=15)
+        self.lbl_ngrok_status = tb.Label(ngrok_frame, text="OFFLINE", bootstyle="danger")
+        self.lbl_ngrok_status.pack(side=tk.LEFT)
+        
+        self.btn_ngrok_toggle = tb.Button(ngrok_frame, text="Start Ngrok Tunnel", command=self.toggle_ngrok_tunnel, bootstyle="warning")
+        self.btn_ngrok_toggle.pack(side=tk.RIGHT)
+        
+        self.lbl_ngrok_url = tb.Label(ngrok_frame, text="WSS URL: Not Running", foreground="gray")
+        self.lbl_ngrok_url.pack(fill=tk.X, padx=5, pady=(5,0))
+
+        # --- 2. Service Control Panel ---
+        ctrl_frame = ttk.Labelframe(main_frame, text=" Backend Services ", padding=10)
+        ctrl_frame.pack(fill=tk.X)
+
+        self.service_info = {
+            "OCPP": {"script": "ocpp_server.py", "status_label": None, "pid_label": None, "pid": None, "button": None},
+            "API": {"script": "main_api.py", "status_label": None, "pid_label": None, "pid": None, "button": None},
+            "OCPI": {"script": "ocpi_service.py", "status_label": None, "pid_label": None, "pid": None, "button": None},
         }
+
+        # Create service rows
+        for prefix, data in self.service_info.items():
+            row = tb.Frame(ctrl_frame)
+            row.pack(fill=tk.X, pady=5)
+            
+            # [FIX A] Button Creation: Store direct reference
+            btn = tb.Button(row, text=f"Start {prefix}", command=lambda p=prefix, s=data['script']: self.toggle_process(p, s))
+            btn.pack(side=tk.LEFT, padx=(5, 10), ipadx=10)
+            data['button'] = btn # STORE DIRECT REFERENCE HERE
+            
+            tb.Label(row, text=f"{prefix} Status:").pack(side=tk.LEFT, padx=10)
+            
+            # Status Lamp
+            data['status_label'] = tb.Label(row, text="● STOPPED", bootstyle="danger")
+            data['status_label'].pack(side=tk.LEFT, padx=5)
+
+            # PID
+            tb.Label(row, text="PID:").pack(side=tk.LEFT, padx=(30, 5))
+            data['pid_label'] = tb.Label(row, text="---", font=("Consolas", 10))
+            data['pid_label'].pack(side=tk.LEFT)
         
-        self.create_ui()
-        
-        # Start Loops
-        threading.Thread(target=self.loop_monitor_resources, daemon=True).start()
-        threading.Thread(target=self.loop_monitor_database, daemon=True).start()
+        # --- 3. Log Viewer ---
+        tb.Label(main_frame, text="Real-time Process Logs:", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(15, 5))
+        self.log_area = tk.Text(main_frame, height=20, bg="#1a1a1a", fg="#00ff00", font=("Consolas", 9), state='normal')
+        self.log_area.pack(fill=tk.BOTH, expand=True)
 
-    def create_ui(self):
-        # Header
-        header = tb.Frame(self, bootstyle="dark", padding=15)
-        header.pack(fill=X)
-        tb.Label(header, text="UNIEV", font=("Impact", 30), bootstyle="inverse-light").pack(side=LEFT)
-        tb.Label(header, text="INFRASTRUCTURE MANAGER", font=("Arial", 10, "bold"), foreground="#00ff00").pack(side=LEFT, padx=10, pady=(15,0))
-        
-        ip_info = tb.Label(header, text=f"HOST IP: {self.get_local_ip()}", font=("Consolas", 14, "bold"), bootstyle="inverse-warning")
-        ip_info.pack(side=RIGHT)
+    # --- NGrok Logic ---
+    def toggle_ngrok_tunnel(self):
+        if ngrok is None:
+            messagebox.showerror("Error", "Library 'pyngrok' tidak ditemukan.")
+            return
 
-        # Main Container
-        container = tb.Frame(self, padding=20)
-        container.pack(fill=BOTH, expand=YES)
-
-        # --- KOLOM KIRI: SERVICE CONTROLS & TRAFFIC ---
-        left_pane = tb.Labelframe(container, text=" Active Services & Nodes ", padding=15, bootstyle="info")
-        left_pane.pack(side=LEFT, fill=BOTH, expand=YES, padx=(0, 10))
-
-        for key, svc in self.services.items():
-            self.create_service_card(left_pane, key, svc)
-
-        # --- KOLOM KANAN: DB & LOGS ---
-        right_pane = tb.Frame(container)
-        right_pane.pack(side=RIGHT, fill=BOTH, expand=YES)
-
-        # DB Panel
-        db_pane = tb.Labelframe(right_pane, text=" Database Connection (Supabase) ", padding=15, bootstyle="success")
-        db_pane.pack(fill=X, pady=(0, 15))
-        
-        self.lbl_db_status = tb.Label(db_pane, text="● CHECKING...", font=("Arial", 14, "bold"), bootstyle="secondary")
-        self.lbl_db_status.pack(anchor=W)
-        
-        stats_frame = tb.Frame(db_pane, padding=(0,10))
-        stats_frame.pack(fill=X)
-        
-        tb.Label(stats_frame, text="Round-Trip Latency:", font=("Arial", 11)).pack(side=LEFT)
-        self.lbl_latency_val = tb.Label(stats_frame, text="0 ms", font=("Consolas", 14, "bold"), bootstyle="warning")
-        self.lbl_latency_val.pack(side=LEFT, padx=10)
-
-        # Logs Panel
-        log_pane = tb.Labelframe(right_pane, text=" System Output Log ", padding=15, bootstyle="secondary")
-        log_pane.pack(fill=BOTH, expand=YES)
-        
-        self.log_area = tk.Text(log_pane, height=10, bg="#0f0f0f", fg="#00ff00", font=("Consolas", 9), state="normal")
-        self.log_area.pack(fill=BOTH, expand=YES)
-
-    def create_service_card(self, parent, key, svc):
-        card = tb.Frame(parent, borderwidth=1, relief="solid", padding=15)
-        card.pack(fill=X, pady=8)
-        
-        # --- ROW 1: Header & Button ---
-        row1 = tb.Frame(card)
-        row1.pack(fill=X)
-        
-        # Nama Service
-        tb.Label(row1, text=f"{svc.name}", font=("Arial", 12, "bold")).pack(side=LEFT)
-        
-        # Tombol Control
-        svc.btn_control = tb.Button(row1, text="START SERVICE", bootstyle="success", width=15, 
-                                    command=lambda k=key: self.toggle_service(k))
-        svc.btn_control.pack(side=RIGHT)
-
-        # --- ROW 2: Technical Info (Status, Port, PID) ---
-        row2 = tb.Frame(card, padding=(0, 10))
-        row2.pack(fill=X)
-
-        # Status Lamp
-        svc.status_lamp = tb.Label(row2, text="● STOPPED", bootstyle="danger", font=("Arial", 10, "bold"), width=12)
-        svc.status_lamp.pack(side=LEFT)
-        
-        # Divider
-        tb.Separator(row2, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=10)
-
-        # Port Number
-        tb.Label(row2, text="PORT:", font=("Arial", 8), foreground="gray").pack(side=LEFT)
-        tb.Label(row2, text=f"{svc.port}", font=("Consolas", 10, "bold"), bootstyle="info").pack(side=LEFT, padx=(2, 10))
-
-        # PID (Process ID)
-        tb.Label(row2, text="PID:", font=("Arial", 8), foreground="gray").pack(side=LEFT)
-        svc.lbl_pid = tb.Label(row2, text="----", font=("Consolas", 10, "bold"), bootstyle="secondary")
-        svc.lbl_pid.pack(side=LEFT, padx=(2, 0))
-
-        # --- ROW 3: Traffic Meters ---
-        row3 = tb.Frame(card)
-        row3.pack(fill=X)
-        
-        # IN Meter
-        f_in = tb.Frame(row3)
-        f_in.pack(side=LEFT, fill=X, expand=YES, padx=(0,5))
-        tb.Label(f_in, text="TRAFFIC IN (RX)", font=("Arial", 7), foreground="gray").pack(anchor=W)
-        svc.lbl_speed_in = tb.Label(f_in, text="0.0 KB/s", font=("Consolas", 10, "bold"), foreground="#5bc0de")
-        svc.lbl_speed_in.pack(anchor=W)
-
-        # OUT Meter
-        f_out = tb.Frame(row3)
-        f_out.pack(side=LEFT, fill=X, expand=YES, padx=(5,0))
-        tb.Label(f_out, text="TRAFFIC OUT (TX)", font=("Arial", 7), foreground="gray").pack(anchor=W)
-        svc.lbl_speed_out = tb.Label(f_out, text="0.0 KB/s", font=("Consolas", 10, "bold"), foreground="#f0ad4e")
-        svc.lbl_speed_out.pack(anchor=W)
-
-    # --- LOGIC SERVICE CONTROL ---
-    def toggle_service(self, key):
-        svc = self.services[key]
-        if svc.process is None:
-            # START
-            self.log(f"Starting {svc.name} on Port {svc.port}...")
-            script_path = os.path.join(ROOT_DIR, 'backend', svc.script)
+        if self.ngrok_tunnel is None:
+            # START TUNNEL
             try:
-                # [PERBAIKAN] Tambahkan "-u" agar log muncul seketika tanpa delay
-                svc.process = subprocess.Popen(
-                    [sys.executable, "-u", script_path], 
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1 # Line buffered
-                )
-                threading.Thread(target=self.read_output, args=(svc.process, key), daemon=True).start()
+                if "OCPP" not in active_processes:
+                    messagebox.showerror("Error", "OCPP Server (Port 9000) harus aktif sebelum Ngrok.")
+                    return
                 
-                # UI Update - ACTIVE STATE
-                svc.btn_control.configure(text="STOP SERVICE", bootstyle="danger")
-                svc.status_lamp.configure(text="● RUNNING", bootstyle="success")
+                self.ngrok_tunnel = ngrok.connect(self.server_port, proto="tcp")
                 
-                # Update PID UI
-                pid_num = svc.process.pid
-                svc.lbl_pid.configure(text=f"{pid_num}", bootstyle="warning")
+                public_url = self.ngrok_tunnel.public_url.replace("tcp://", "wss://")
+
+                self.lbl_ngrok_url.config(text=f"WSS URL: {public_url}", foreground="green")
+                self.lbl_ngrok_status.config(text="ONLINE", bootstyle="success")
+                self.btn_ngrok_toggle.config(text="Stop Ngrok Tunnel", bootstyle="danger")
+                messagebox.showinfo("Success", f"Ngrok Tunnel Aktif:\n{public_url}")
+                log_message(f"🌐 Ngrok Tunnel Started: {public_url}", self.log_area)
                 
+            except PyngrokNgrokInstallError:
+                messagebox.showerror("Error", "Ngrok client belum terinstal.")
+            except PyngrokSecurityError:
+                 messagebox.showerror("Error", "Ngrok AUTH TOKEN hilang.")
             except Exception as e:
-                self.log(f"Error starting {key}: {e}")
+                messagebox.showerror("Error", f"Gagal membuat tunnel: {e}")
+                self.ngrok_tunnel = None
         else:
-            # ... (kode stop tetap sama) ...
-            # STOP
-            self.log(f"Stopping {svc.name} (PID: {svc.process.pid})...")
-            svc.process.terminate()
-            svc.process = None
-            svc.prev_io = None
+            # STOP TUNNEL
+            ngrok.disconnect(self.ngrok_tunnel.public_url)
+            self.ngrok_tunnel = None
+            self.lbl_ngrok_url.config(text="WSS URL: Not Running", foreground="gray")
+            self.lbl_ngrok_status.config(text="OFFLINE", bootstyle="danger")
+            self.btn_ngrok_toggle.config(text="Start Ngrok Tunnel", bootstyle="warning")
+            log_message("🌐 Ngrok Tunnel Stopped.", self.log_area)
+
+
+    # --- Process Management Logic ---
+    def toggle_process(self, prefix, script_name):
+        if prefix in active_processes and active_processes[prefix].poll() is None:
+            # STOP Process
+            active_processes[prefix].terminate() 
+        else:
+            # START Process in a new thread
+            threading.Thread(target=run_process_async, args=(script_name, prefix, self.log_area), daemon=True).start()
+
+    # --- Monitoring Loop ---
+    def update_status_loop(self):
+        # [FINAL FIX] Menggunakan referensi langsung (data['button'])
+        for prefix, data in self.service_info.items():
+            process = active_processes.get(prefix)
+            btn_widget = data['button'] # Retrieve the stored button reference
             
-            # UI Update - STOPPED STATE
-            svc.btn_control.configure(text="START SERVICE", bootstyle="success")
-            svc.status_lamp.configure(text="● STOPPED", bootstyle="danger")
-            
-            # Reset Metrics & PID
-            svc.lbl_pid.configure(text="----", bootstyle="secondary")
-            svc.lbl_speed_in.configure(text="0.0 KB/s")
-            svc.lbl_speed_out.configure(text="0.0 KB/s")
-
-    def read_output(self, proc, key):
-        while True:
-            line = proc.stdout.readline()
-            if not line: break
-            self.log(f"[{key}] {line.strip()}")
-
-    # --- LOGIC MONITORING (TRAFFIC) ---
-    def loop_monitor_resources(self):
-        while self.running:
-            for key, svc in self.services.items():
-                if svc.process and svc.process.poll() is None:
-                    try:
-                        proc = psutil.Process(svc.process.pid)
-                        io = proc.io_counters() 
-                        
-                        if svc.prev_io:
-                            read_diff = io.read_bytes - svc.prev_io.read_bytes
-                            write_diff = io.write_bytes - svc.prev_io.write_bytes
-                            
-                            svc.current_speed_in = read_diff / 1024
-                            svc.current_speed_out = write_diff / 1024
-                        
-                        svc.prev_io = io
-                    except:
-                        pass
-                else:
-                    svc.current_speed_in = 0
-                    svc.current_speed_out = 0
-            
-            self.after(0, self.update_traffic_ui)
-            time.sleep(1)
-
-    def update_traffic_ui(self):
-        for key, svc in self.services.items():
-            txt_in = f"{svc.current_speed_in:.1f} KB/s"
-            txt_out = f"{svc.current_speed_out:.1f} KB/s"
-            
-            if svc.lbl_speed_in: svc.lbl_speed_in.configure(text=txt_in)
-            if svc.lbl_speed_out: svc.lbl_speed_out.configure(text=txt_out)
-
-    # --- LOGIC MONITORING (DATABASE) ---
-    def loop_monitor_database(self):
-        while self.running:
-            latency = Database.get_latency()
-            self.after(0, lambda l=latency: self.update_db_ui(l))
-            time.sleep(3)
-
-    def update_db_ui(self, latency):
-        if latency >= 0:
-            self.lbl_db_status.configure(text="● CONNECTED", bootstyle="success")
-            self.lbl_latency_val.configure(text=f"{latency} ms")
-            if latency > 500: 
-                self.lbl_latency_val.configure(bootstyle="danger")
+            if process and process.poll() is None:
+                # Running
+                data['status_label'].config(text="● RUNNING", bootstyle="success")
+                data['pid_label'].config(text=str(process.pid))
+                data['pid'] = process.pid
+                btn_widget.config(text=f"Stop {prefix}", bootstyle="danger") 
             else:
-                self.lbl_latency_val.configure(bootstyle="success")
-        else:
-            self.lbl_db_status.configure(text="● DISCONNECTED", bootstyle="danger")
-            self.lbl_latency_val.configure(text="Timeout", bootstyle="danger")
+                # Stopped
+                data['status_label'].config(text="● STOPPED", bootstyle="danger")
+                data['pid_label'].config(text="---")
+                data['pid'] = None
+                btn_widget.config(text=f"Start {prefix}", bootstyle="success") 
+                
+        self.after(1000, self.update_status_loop) # Loop every second
 
-    def log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_area.insert(tk.END, f"[{ts}] {msg}\n")
-        self.log_area.see(tk.END)
+    # --- Cleanup ---
+    def on_close(self):
+        # Stop all running subprocesses and Ngrok tunnel
+        if self.ngrok_tunnel:
+            self.toggle_ngrok_tunnel() 
+        for prefix in list(active_processes.keys()):
+            if prefix in active_processes and active_processes[prefix].poll() is None:
+                 active_processes[prefix].terminate()
 
-    def get_local_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except:
-            return "127.0.0.1"
+        self.quit()
+        self.destroy()
 
 if __name__ == "__main__":
-    app = UnievOrchestrator()
-    app.mainloop()
+    root = UnievLauncher()
+    root.mainloop()
