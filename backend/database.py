@@ -1,42 +1,69 @@
 # backend/database.py
-import time
+import os
+import logging
 from supabase import create_client, Client
 
-# --- UNIVERSAL IMPORT BLOCK ---
+logger = logging.getLogger("UNIEV")
+
 try:
     from backend import config
-except ImportError:
-    import config
-# -----------------------------
+except Exception:
+    try:
+        import config
+    except Exception:
+        config = None
+
+_supabase: Client | None = None
+
+def get_client() -> Client | None:
+    global _supabase
+    if _supabase is not None:
+        return _supabase
+    try:
+        url = os.getenv("SUPABASE_URL") or getattr(config, "SUPABASE_URL", None)
+        key = os.getenv("SUPABASE_KEY") or getattr(config, "SUPABASE_KEY", None)
+        if not url or not key:
+            raise RuntimeError("Supabase credentials missing")
+        _supabase = create_client(url, key)
+        try:
+            _supabase.table("chargers").select("count").execute()
+            logger.info("✅ Database connection established")
+        except Exception:
+            logger.warning("⚠️ Supabase connected but test query failed; continuing")
+        return _supabase
+    except Exception as e:
+        logger.warning(f"⚠️ Using mock database client: {e}")
+        class MockClient:
+            def table(self, name):
+                return MockTable()
+        class MockTable:
+            def select(self, *args, **kwargs): return self
+            def insert(self, data): return self
+            def update(self, data): return self
+            def upsert(self, data): return self
+            def eq(self, *args, **kwargs): return self
+            def execute(self):
+                class MockResult:
+                    data = []
+                return MockResult()
+        return MockClient()
+
+supabase = get_client()
 
 class Database:
-    _instance = None
-
     @staticmethod
     def get_client():
-        if Database._instance is None:
-            try:
-                Database._instance = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-            except Exception as e:
-                # print(f"[DB] Init Error: {e}") # Silent agar tidak spam log
-                return None
-        return Database._instance
+        return supabase
 
     @staticmethod
     def get_latency():
-        """Mengukur kecepatan respons DB dalam milidetik (ms)"""
-        client = Database.get_client()
-        if not client: return -1
-        
-        start_time = time.time()
-        try:
-            # Query super ringan (HEAD request)
-            client.table("chargers").select("charger_id", count="exact").limit(1).execute()
-            latency = (time.time() - start_time) * 1000 # convert to ms
-            return round(latency, 1)
-        except:
-            Database._instance = None # Reset jika error
+        import time
+        client = supabase
+        if client is None:
             return -1
-
-# Global Object
-supabase = Database.get_client()
+        start = time.time()
+        try:
+            client.table("chargers").select("charger_id").limit(1).execute()
+            return round((time.time() - start) * 1000, 1)
+        except Exception:
+            return -1
